@@ -142,12 +142,14 @@ def _rotate_once(db, terminal_id, credential, rotation_id):
     # 旧凭证已被轮换过：查找消费它的那条轮换记录。
     rotation = db.find_rotation_by_old_hash(family["family_id"], cred_hash)
     if rotation and rotation["rotation_id"] == rotation_id:
-        # 幂等重放：原样返回首次提交的后继凭证与代次，不推进代次。
+        # 幂等重放：用受保护记录精确还原首次提交的后继凭证与代次，不推进代次。
+        # 持久化的只是密文，拿到数据库文件也无法直接作为 Bearer 凭证使用。
+        successor = db.reveal_secret(rotation["new_credential_enc"])
         return {
             "outcome": "replayed",
             "family_id": family["family_id"],
             "terminal_id": terminal_id,
-            "credential": rotation["new_credential"],
+            "credential": successor,
             "generation": rotation["new_generation"],
             "family_status": family["status"],
             "rotation_id": rotation_id,
@@ -174,9 +176,11 @@ def _accept_rotation(db, family, terminal_id, cred, cred_hash, rotation_id):
     db.set_credential_status(cred["id"], "rotated")
     db.insert_credential(family["family_id"], _hash(new_credential),
                          new_generation, "current", now)
+    # 持久化受保护密文（重放时可恢复）与哈希（凭证匹配键），绝不落明文。
+    protected = db.protect_secret(new_credential)
     try:
         db.insert_rotation(family["family_id"], terminal_id, rotation_id,
-                           cred_hash, new_credential, _hash(new_credential),
+                           cred_hash, protected, _hash(new_credential),
                            new_generation, now)
     except sqlite3.IntegrityError:
         raise ConcurrentRotation()

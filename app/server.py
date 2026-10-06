@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import service
+from crypto_box import InvalidToken
 from storage import Storage
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -154,6 +155,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": "unknown_terminal"})
         except service.InvalidCredentialError:
             return self._send_json(401, {"error": "invalid_credential"})
+        except InvalidToken:
+            # 持久化的受保护凭证无法认证（密钥不匹配或记录被篡改）。
+            return self._send_json(500, {"error": "protected_credential_unavailable"})
 
         # 提交已完成。若启用「断回应」故障，则丢弃响应（客户端只见连接中断）。
         if fault_enabled("drop_after_commit"):
@@ -187,6 +191,11 @@ def main():
     global STORAGE
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     STORAGE = Storage(DB_PATH)
+    if STORAGE.key_source == "env":
+        print("credential envelope key loaded from CREDENTIAL_MASTER_KEY", flush=True)
+    else:
+        print("credential envelope key loaded from data-directory key file (0600);"
+              " set CREDENTIAL_MASTER_KEY for stronger key separation", flush=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     print(f"deep-space ground station listening on :{PORT}, db={DB_PATH}", flush=True)

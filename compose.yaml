@@ -6,8 +6,13 @@ services:
     environment:
       PORT: "8080"
       DB_PATH: /data/app.db
+      # 可选：后继凭证信封加密主密钥（base64/base64url/hex，32 字节）。
+      # 由编排注入时密钥不落在 app-data 卷，整卷备份也无法还原后继凭证；
+      # 不设置则自动使用 /data 下 0600 权限的随机密钥文件。
+      # 生成：openssl rand -base64 32
+      CREDENTIAL_MASTER_KEY: "${CREDENTIAL_MASTER_KEY:-}"
     volumes:
-      - app-data:/data          # SQLite 持久化：重启后重放仍可恢复
+      - app-data:/data          # SQLite 持久化：重启后重放仍可恢复（只存哈希与密文）
     ports:
       - "${APP_HOST_PORT:-8080}:8080"   # 可配置宿主机端口，健康检查: GET /health
     healthcheck:

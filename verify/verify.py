@@ -104,7 +104,7 @@ def create_family(terminal):
 # ---------------------------------------------------------------- 单元测试
 
 def step_unit_tests():
-    print("\n== 1/6 代码单元测试 ==", flush=True)
+    print("\n== 1/7 代码单元测试 ==", flush=True)
     tests_dir = os.path.join(APP_DIR, "tests")
     proc = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", tests_dir, "-v"],
@@ -112,13 +112,35 @@ def step_unit_tests():
     )
     tail = "\n".join((proc.stderr or proc.stdout).strip().splitlines()[-6:])
     print(tail, flush=True)
-    record("单元测试（创建/轮换/重放/重启恢复/并发/撤销）", proc.returncode == 0)
+    record("单元测试（创建/轮换/重放/重启恢复/并发/撤销/密文持久化/迁移）",
+           proc.returncode == 0)
+
+
+# ------------------------------------------------- 持久化凭证明文审计
+
+def step_credential_persistence_audit():
+    print("\n== 2/7 持久化后继凭证明文审计（SQLite 落盘检查）==", flush=True)
+    probe = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "credential_persistence_probe.py")
+    env = dict(os.environ, APP_DIR=APP_DIR)
+    proc = subprocess.run(
+        [sys.executable, probe], capture_output=True, text=True, env=env,
+    )
+    print(proc.stdout.strip(), flush=True)
+    if proc.stderr.strip():
+        print(proc.stderr.strip(), flush=True)
+    triggered = "BUG_PLAINTEXT_ROTATION_CREDENTIAL=True" in proc.stdout
+    record("轮换持久化记录不含可直接作为 Bearer 提交的后继凭证明文",
+           proc.returncode == 0 and not triggered,
+           "发现可直接使用的明文后继凭证！" if triggered else "")
+    record("受保护后继凭证在重启后可精确重放（可恢复值而非仅哈希）",
+           proc.returncode == 0 and not triggered)
 
 
 # ---------------------------------------------------------------- 冒烟
 
 def step_smoke():
-    print("\n== 2/6 API/HTTP 冒烟 ==", flush=True)
+    print("\n== 3/7 API/HTTP 冒烟 ==", flush=True)
     try:
         status, body = req("GET", "/health")
         record("GET /health 返回健康", status == 200 and body.get("status") == "ok",
@@ -147,7 +169,7 @@ def step_smoke():
 # ------------------------------------------------------- 场景 A：断回应恢复
 
 def step_disconnect_recovery():
-    print("\n== 3/6 场景 A：断回应（提交后断连）+ 重启恢复 ==", flush=True)
+    print("\n== 4/7 场景 A：断回应（提交后断连）+ 重启恢复 ==", flush=True)
     terminal = f"term-drop-{SFX}"
     rid = f"rot-drop-{SFX}"
     status, fam = create_family(terminal)
@@ -201,7 +223,7 @@ def step_disconnect_recovery():
 # ------------------------------------------------------- 场景 B：并发同标识
 
 def step_concurrent_same_id():
-    print("\n== 4/6 场景 B：两个并发相同请求 ==", flush=True)
+    print("\n== 5/7 场景 B：两个并发相同请求 ==", flush=True)
     terminal = f"term-conc-{SFX}"
     rid = f"rot-conc-{SFX}"
     status, fam = create_family(terminal)
@@ -237,7 +259,7 @@ def step_concurrent_same_id():
 # ------------------------------------------------- 场景 C：异标识重放 → 撤销
 
 def step_reuse_revocation():
-    print("\n== 5/6 场景 C：异标识重放 → 授权族撤销 ==", flush=True)
+    print("\n== 6/7 场景 C：异标识重放 → 授权族撤销 ==", flush=True)
     terminal = f"term-reuse-{SFX}"
     status, fam = create_family(terminal)
     if status != 201:
@@ -274,7 +296,7 @@ def step_reuse_revocation():
 # ------------------------------------------------------- 页面可观察结果
 
 def step_page_observability():
-    print("\n== 6/6 页面可观察结果校验 ==", flush=True)
+    print("\n== 7/7 页面可观察结果校验 ==", flush=True)
     try:
         status, html = get_text("/")
     except Exception as e:
@@ -313,6 +335,7 @@ def main():
     else:
         record("等待应用健康", True)
         step_unit_tests()
+        step_credential_persistence_audit()
         step_smoke()
         step_disconnect_recovery()
         step_concurrent_same_id()

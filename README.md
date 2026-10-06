@@ -10,6 +10,23 @@
 - **异标识重放（重用检测）**：已轮换旧凭证搭配不同轮换标识再次出现 → 整个授权族撤销并记录原因，**此前签发的后继凭证随后同样被拒绝**；
 - **健康检查**：`GET /health`，宿主机端口可通过 `APP_HOST_PORT` 配置。
 
+## 持久化安全（后继凭证不以明文落盘）
+
+轮换记录必须支持「断回应后精确重放同一后继凭证」，但持久化副本**不能**成为可直接
+提交的 Bearer 刷新凭证来源——否则能读取 SQLite 文件的卷快照、备份或运行环境即可
+继续轮换。系统采用信封加密（Encrypt-then-MAC，仅标准库，见 `app/crypto_box.py`）：
+
+- `rotations` 表只保存后继凭证的 **SHA-256 哈希**（凭证匹配键）与**受保护密文**
+  （`new_credential_enc`，随机 nonce + 密文 + 认证标签），没有明文列；
+- 密文不是刷新凭证：直接把它作为 Bearer 提交会得到 401，拿到数据库文件而无主密钥
+  时解密必然失败（认证标签不匹配）；仅保存哈希无法满足精确重放，密文则可由服务解开；
+- 主密钥优先取环境变量 `CREDENTIAL_MASTER_KEY`（base64/base64url/hex，32 字节，
+  `openssl rand -base64 32` 生成），密钥由编排注入、不写入 `app-data` 卷，整卷备份
+  也无法还原后继凭证；未配置时在数据目录自动维护 `0600` 权限随机密钥文件
+  （可防「仅数据库文件泄露」，但密钥随卷备份，安全性弱于环境注入）；
+- 升级旧库（曾有 `new_credential` 明文列）时自动加密回填、重建表并 `VACUUM`
+  擦除文件内明文残留；主密钥丢失时历史重放安全失败（不返回错误凭证），新轮换不受影响。
+
 ## 快速开始（Docker Compose）
 
 ```bash
@@ -66,12 +83,18 @@ rotated        与首次不同         revoked：授权族撤销，记录重用�
 
 ## verify 验收内容（退出码即结果）
 
-1. **代码测试**：`app/tests/` 下 12 项单元测试（创建/首轮换/重放/重启恢复/并发/撤销/错误路径）；
-2. **API/HTTP 冒烟**：健康端点、建族、首轮换、页面可达；
-3. **场景 A 断回应恢复**：启用故障 → 首次请求连接中断 → 进程重启 → 原标识重传取回同一后继（`replayed`，代次 2 不再推进）→ 后继凭证仍可继续轮换；
-4. **场景 B 并发同标识**：两线程同时发起相同请求 → 同一凭证同一世代，恰一次 `accepted` 一次 `replayed`；
-5. **场景 C 异标识重放**：撤销 + 原因可见 + 后继凭证被拒 + 原重放亦被拒；
-6. **页面可观察结果**：页面包含「已接受/重放/已撤销/撤销原因/断回应」等呈现元素，且轮换响应字段与页面渲染一一对应。
+1. **代码测试**：`app/tests/` 单元测试（创建/首轮换/重放/重启恢复/并发/撤销/错误路径，
+   以及密文持久化、密文不可直接提交、旧库迁移、篡改/错误密钥检测）；
+2. **持久化凭证明文审计**：建族 + 真实轮换后直接读取 SQLite 轮换记录与文件原始字节，
+   确认不存在可直接作为 Bearer 提交的后继凭证（含把每个持久化字符串直提鉴权的探测），
+   并确认重启后相同请求仍精确重放同一后继；发现明文时输出
+   `BUG_PLAINTEXT_ROTATION_CREDENTIAL=True` 且该项失败（独立脚本
+   `verify/credential_persistence_probe.py`，退出码 1）；
+3. **API/HTTP 冒烟**：健康端点、建族、首轮换、页面可达；
+4. **场景 A 断回应恢复**：启用故障 → 首次请求连接中断 → 进程重启 → 原标识重传取回同一后继（`replayed`，代次 2 不再推进）→ 后继凭证仍可继续轮换；
+5. **场景 B 并发同标识**：两线程同时发起相同请求 → 同一凭证同一世代，恰一次 `accepted` 一次 `replayed`；
+6. **场景 C 异标识重放**：撤销 + 原因可见 + 后继凭证被拒 + 原重放亦被拒；
+7. **页面可观察结果**：页面包含「已接受/重放/已撤销/撤销原因/断回应」等呈现元素，且轮换响应字段与页面渲染一一对应。
 
 ## 本地开发（无 Docker）
 
@@ -87,12 +110,15 @@ APP_BASE_URL=http://127.0.0.1:18080 APP_DIR=$PWD/app python3 verify/verify.py
 app/
   server.py            HTTP 服务（标准库 http.server）
   service.py           轮换核心逻辑（幂等/重用检测/撤销）
-  storage.py           SQLite 持久化（WAL，唯一约束兜底）
+  storage.py           SQLite 持久化（WAL，唯一约束兜底，后继凭证仅存密文+哈希）
+  crypto_box.py        后继凭证信封加密（Encrypt-then-MAC，主密钥来自环境/0600 密钥文件）
   static/index.html    操作员页面
   run.sh               进程守护循环（退出即重启）
   tests/test_rotation.py
+  tests/test_protected_persistence.py
 verify/
-  verify.py            验收器（compose 的 verify 服务）
+  verify.py                       验收器（compose 的 verify 服务）
+  credential_persistence_probe.py 持久化明文审计（BUG_PLAINTEXT_ROTATION_CREDENTIAL 信号）
   Dockerfile
-compose.yaml           app + verify，APP_HOST_PORT 可配置宿主机端口
+compose.yaml           app + verify，APP_HOST_PORT / CREDENTIAL_MASTER_KEY 可配置宿主机端口
 ```
