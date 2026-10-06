@@ -5,16 +5,21 @@
   A. 断回应恢复：提交后断连 → 重启 → 凭原标识恢复已持久化的后继，代次不再推进
   B. 并发同标识：两个并发相同请求只观察到同一结果
   C. 异标识重放：撤销授权族并给出原因，后继凭证随后同样被拒绝
-另含：代码单元测试、API/HTTP 冒烟、页面可观察结果校验。
+另含：代码单元测试、落盘明文探针、数据卷落盘安全检查、API/HTTP 冒烟、
+页面可观察结果校验。
 
 环境变量：
-  APP_BASE_URL  被测服务地址（默认 http://127.0.0.1:8080）
-  APP_DIR       应用源码目录（用于跑单元测试，默认 ../app）
+  APP_BASE_URL   被测服务地址（默认 http://127.0.0.1:8080）
+  APP_DIR        应用源码目录（用于跑单元测试，默认 ../app）
+  APP_DATA_PATH  应用 SQLite 数据库在验收容器内的只读挂载路径
+                 （compose 中为 /data/app.db；未设置时跳过数据卷字节检查）
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -27,6 +32,9 @@ APP_DIR = os.environ.get(
     "APP_DIR",
     os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app")),
 )
+APP_DATA_PATH = os.environ.get("APP_DATA_PATH", "")
+PROBE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "check_plaintext_rotation.py")
 SFX = uuid.uuid4().hex[:8]  # 每次运行使用全新终端标识，避免与卷中历史数据冲突
 
 RESULTS = []
@@ -112,7 +120,58 @@ def step_unit_tests():
     )
     tail = "\n".join((proc.stderr or proc.stdout).strip().splitlines()[-6:])
     print(tail, flush=True)
-    record("单元测试（创建/轮换/重放/重启恢复/并发/撤销）", proc.returncode == 0)
+    record("单元测试（创建/轮换/重放/重启恢复/并发/撤销/落盘保护/迁移）",
+           proc.returncode == 0)
+
+    # 落盘明文探针：临时 SQLite 上建族并真实轮换，直接读取持久化记录，
+    # 发现「与服务返回值逐字节相同的可直投后继凭证」时会输出
+    # BUG_PLAINTEXT_ROTATION_CREDENTIAL=True 并以 1 退出。
+    with tempfile.TemporaryDirectory(prefix="probe-key-") as key_dir:
+        probe_env = dict(os.environ, APP_DIR=APP_DIR,
+                         CREDENTIAL_KEY_FILE=os.path.join(key_dir, "k"))
+        probe = subprocess.run(
+            [sys.executable, PROBE_PATH], capture_output=True, text=True, env=probe_env,
+        )
+    print(probe.stdout.strip(), flush=True)
+    ok = (probe.returncode == 0
+          and "BUG_PLAINTEXT_ROTATION_CREDENTIAL=True" not in probe.stdout
+          and "BUG_PLAINTEXT_ROTATION_CREDENTIAL=False" in probe.stdout)
+    record("落盘明文探针：轮换记录不保存可直投后继凭证",
+           ok, f"exit={probe.returncode}" + (f"; {probe.stderr.strip()}" if not ok else ""))
+
+
+# --------------------------------------------- 数据卷落盘安全（只读挂载 /data）
+
+def read_volume_bytes():
+    """读取应用 SQLite 数据卷的全部相关文件字节（db / wal / shm）的副本。"""
+    if not APP_DATA_PATH or not os.path.exists(APP_DATA_PATH):
+        return None
+    scratch = tempfile.mkdtemp(prefix="app-data-")
+    blob = b""
+    try:
+        for index, suffix in enumerate(("", "-wal", "-shm")):
+            src = APP_DATA_PATH + suffix
+            if os.path.exists(src):
+                dst = os.path.join(scratch, f"copy-{index}")
+                shutil.copyfile(src, dst)
+                with open(dst, "rb") as fh:
+                    blob += fh.read()
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return blob
+
+
+def assert_successor_not_persisted_plaintext(name, successor):
+    volume = read_volume_bytes()
+    if volume is None:
+        return record(name, True, "跳过：未以 APP_DATA_PATH 只读挂载数据卷（本地开发模式）")
+    leaked = successor.encode("utf-8") in volume
+    record(name, not leaked,
+           "数据卷（含 WAL）字节中未出现后继凭证明文" if not leaked
+           else "后继凭证明文直接出现在持久化卷中")
+    if not leaked:
+        record("持久化卷保存了受保护信封（pae1.）而非明文",
+               b"pae1." in volume)
 
 
 # ---------------------------------------------------------------- 冒烟
@@ -139,6 +198,11 @@ def step_smoke():
           and rot.get("generation") == 2
           and rot.get("credential") not in (None, fam["credential"]))
     record("POST /api/rotate 首次轮换被接受（代次递增）", ok, f"HTTP {status}")
+    if ok:
+        # 回归验收：完成首次轮换后，持久化数据不含可直接用于后续轮换的后继凭证。
+        assert_successor_not_persisted_plaintext(
+            "首次轮换后持久化数据不含可直投后继凭证（仅受保护信封）",
+            rot["credential"])
 
     status, page = get_text("/")
     record("GET / 操作员页面可访问", status == 200 and "深空地面站" in page, f"HTTP {status}")
@@ -182,6 +246,11 @@ def step_disconnect_recovery():
     if not ok:
         return
     successor = r1["credential"]
+
+    # 回归验收（数据卷检查）：断回应 + 重启后的重放记录，
+    # 同样不含可直投后继明文，仅保存可恢复的受保护值与必要元数据。
+    assert_successor_not_persisted_plaintext(
+        "断回应恢复后持久化数据仍无可直投后继凭证", successor)
 
     status, r2 = rotate(terminal, cred0, rid)
     ok = (status == 200 and r2.get("outcome") == "replayed"

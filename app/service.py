@@ -142,16 +142,24 @@ def _rotate_once(db, terminal_id, credential, rotation_id):
     # 旧凭证已被轮换过：查找消费它的那条轮换记录。
     rotation = db.find_rotation_by_old_hash(family["family_id"], cred_hash)
     if rotation and rotation["rotation_id"] == rotation_id:
-        # 幂等重放：原样返回首次提交的后继凭证与代次，不推进代次。
-        return {
-            "outcome": "replayed",
-            "family_id": family["family_id"],
-            "terminal_id": terminal_id,
-            "credential": rotation["new_credential"],
-            "generation": rotation["new_generation"],
-            "family_status": family["status"],
-            "rotation_id": rotation_id,
-        }
+        # 幂等重放：用数据库外的密钥解出首次提交的后继凭证并原样返回，
+        # 代次不推进。信封认证失败（篡改 / 密钥不符 / 记录被搬运）时
+        # new_credential 为 None，不能把不可用结果当作重放回送。
+        replayed_credential = rotation["new_credential"]
+        if replayed_credential is not None and _hash(replayed_credential) == \
+                rotation["new_credential_hash"]:
+            return {
+                "outcome": "replayed",
+                "family_id": family["family_id"],
+                "terminal_id": terminal_id,
+                "credential": replayed_credential,
+                "generation": rotation["new_generation"],
+                "family_status": family["status"],
+                "rotation_id": rotation_id,
+            }
+        raise RuntimeError(
+            "rotation record failed integrity verification; refusing replay"
+        )
 
     # 相同旧凭证 + 不同轮换标识 => 凭证重用，撤销整个授权族。
     reason = (
@@ -169,14 +177,20 @@ def _rotate_once(db, terminal_id, credential, rotation_id):
 
 def _accept_rotation(db, family, terminal_id, cred, cred_hash, rotation_id):
     new_credential = _new_credential()
+    new_hash = _hash(new_credential)
     new_generation = family["generation"] + 1
     now = _now()
     db.set_credential_status(cred["id"], "rotated")
-    db.insert_credential(family["family_id"], _hash(new_credential),
+    db.insert_credential(family["family_id"], new_hash,
                          new_generation, "current", now)
+    # 后继凭证仅以绑定记录上下文的认证加密信封落盘；明文不离进程内存。
+    envelope = db.protect_successor(
+        family["family_id"], rotation_id, new_generation,
+        new_hash, new_credential,
+    )
     try:
         db.insert_rotation(family["family_id"], terminal_id, rotation_id,
-                           cred_hash, new_credential, _hash(new_credential),
+                           cred_hash, envelope, new_hash,
                            new_generation, now)
     except sqlite3.IntegrityError:
         raise ConcurrentRotation()

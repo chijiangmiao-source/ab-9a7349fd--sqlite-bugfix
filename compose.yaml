@@ -6,8 +6,13 @@ services:
     environment:
       PORT: "8080"
       DB_PATH: /data/app.db
+      # 后继凭证保护密钥：位于与 SQLite 数据卷分离的独立密钥卷，
+      # 拷贝 / 备份 / 泄露数据卷不会同时获得解密能力。
+      # 也可由外部密钥管理系统改用 CREDENTIAL_PROTECTION_KEY（64 位十六进制）注入。
+      CREDENTIAL_KEY_FILE: /secrets/credential-protection.key
     volumes:
-      - app-data:/data          # SQLite 持久化：重启后重放仍可恢复
+      - app-data:/data        # SQLite 持久化：重启后重放仍可恢复
+      - app-keys:/secrets     # 数据保护密钥（独立卷，0600，首启自动生成）
     ports:
       - "${APP_HOST_PORT:-8080}:8080"   # 可配置宿主机端口，健康检查: GET /health
     healthcheck:
@@ -27,7 +32,11 @@ services:
     environment:
       APP_BASE_URL: http://app:8080
       APP_DIR: /acceptance/app
-    # 跑完单元测试 + 冒烟 + 三大场景 + 页面校验后退出，退出码即验收结果。
+      APP_DATA_PATH: /data/app.db   # 只读挂载数据卷：验收直接检查落盘字节
+    volumes:
+      - app-data:/data:ro
+    # 跑完单元测试 + 落盘安全探针 + 冒烟 + 三大场景 + 页面校验后退出，退出码即验收结果。
 
 volumes:
   app-data:
+  app-keys:
